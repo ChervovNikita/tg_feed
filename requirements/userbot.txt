@@ -1,0 +1,6 @@
+# Userbot (Pyrogram) requirements
+-r base.txt
+pyrogram>=2.0.0
+tgcrypto>=1.2.5
+kafka-python>=2.0.2
+

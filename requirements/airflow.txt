@@ -1,0 +1,7 @@
+# Airflow requirements (most deps handled by base image)
+psycopg2-binary>=2.9.9
+numpy>=1.26.0
+scikit-learn>=1.4.0
+requests>=2.31.0
+pgvector>=0.2.4
+
