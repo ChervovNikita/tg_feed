@@ -22,6 +22,7 @@ from schemas import (
     HealthResponse
 )
 from metrics import models_trained_total
+from admin import router as admin_router
 
 # Configure logging
 logging.basicConfig(
@@ -75,6 +76,9 @@ app.add_middleware(
 # Mount Prometheus metrics endpoint
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
+
+# Include admin router
+app.include_router(admin_router)
 
 
 @app.get("/health", response_model=HealthResponse)

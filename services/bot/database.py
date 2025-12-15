@@ -1,5 +1,5 @@
 """Database operations for Bot service."""
-from typing import Optional
+from typing import Optional, List
 import asyncpg
 
 from config import settings
@@ -37,60 +37,74 @@ class Database:
             )
             return user_id
     
-    async def add_subscription(
-        self,
-        user_id: int,
-        channel_id: int,
-        channel_name: str = None,
-        channel_username: str = None
-    ):
-        """Add channel subscription for user."""
+    # ============ Tag Subscriptions ============
+    
+    async def add_tag_subscription(self, user_id: int, tag: str):
+        """Add tag subscription for user."""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO subscriptions (user_id, channel_id, channel_name, channel_username, is_active)
-                VALUES ($1, $2, $3, $4, TRUE)
-                ON CONFLICT (user_id, channel_id) 
-                DO UPDATE SET 
-                    is_active = TRUE,
-                    channel_name = COALESCE($3, subscriptions.channel_name),
-                    channel_username = COALESCE($4, subscriptions.channel_username)
+                INSERT INTO tag_subscriptions (user_id, tag, is_active)
+                VALUES ($1, $2, TRUE)
+                ON CONFLICT (user_id, tag) DO UPDATE SET is_active = TRUE
                 """,
-                user_id, channel_id, channel_name, channel_username
+                user_id, tag.lower()
             )
     
-    async def remove_subscription(self, user_id: int, channel_id: int):
-        """Remove channel subscription for user."""
+    async def remove_tag_subscription(self, user_id: int, tag: str):
+        """Remove tag subscription for user."""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                UPDATE subscriptions 
-                SET is_active = FALSE 
-                WHERE user_id = $1 AND channel_id = $2
+                UPDATE tag_subscriptions SET is_active = FALSE 
+                WHERE user_id = $1 AND tag = $2
                 """,
-                user_id, channel_id
+                user_id, tag.lower()
             )
     
-    async def get_subscriptions(self, user_id: int) -> list[dict]:
-        """Get all active subscriptions for user."""
+    async def get_user_tags(self, user_id: int) -> List[str]:
+        """Get all active tag subscriptions for user."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT channel_id, channel_name, channel_username 
-                FROM subscriptions 
+                SELECT tag FROM tag_subscriptions 
                 WHERE user_id = $1 AND is_active = TRUE
-                ORDER BY created_at DESC
+                ORDER BY tag
                 """,
                 user_id
             )
-            return [dict(row) for row in rows]
+            return [row['tag'] for row in rows]
+    
+    # ============ Posts/Articles ============
+    
+    async def get_post(self, post_id: int) -> Optional[dict]:
+        """Get post by ID."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, source, source_id, source_url, title, text, author, tag
+                FROM posts WHERE id = $1
+                """,
+                post_id
+            )
+            return dict(row) if row else None
+    
+    async def get_post_url(self, post_id: int) -> Optional[str]:
+        """Get source URL for a post."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT source_url FROM posts WHERE id = $1",
+                post_id
+            )
+    
+    # ============ User Stats ============
     
     async def get_user_stats(self, user_id: int) -> dict:
         """Get user statistics."""
         async with self.pool.acquire() as conn:
-            # Count subscriptions
-            subs_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND is_active = TRUE",
+            # Count tag subscriptions
+            tags_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM tag_subscriptions WHERE user_id = $1 AND is_active = TRUE",
                 user_id
             )
             
@@ -118,7 +132,7 @@ class Database:
             )
             
             return {
-                'subscriptions': subs_count or 0,
+                'tags': tags_count or 0,
                 'predictions': preds_count or 0,
                 'likes': reactions['likes'] if reactions else 0,
                 'dislikes': reactions['dislikes'] if reactions else 0,
@@ -126,20 +140,7 @@ class Database:
                 'model_samples': model['num_samples'] if model else 0,
                 'model_updated': model['updated_at'] if model else None
             }
-    
-    async def get_post_channel_id(self, post_id: int) -> Optional[int]:
-        """Get channel_id for a post."""
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT channel_id FROM posts WHERE id = $1",
-                post_id
-            )
-    
-    async def mute_channel_for_user(self, user_id: int, channel_id: int):
-        """Mute (unsubscribe from) a channel."""
-        await self.remove_subscription(user_id, channel_id)
 
 
 # Global database instance
 db = Database()
-

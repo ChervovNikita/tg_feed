@@ -5,11 +5,14 @@ from pydantic import BaseModel, Field
 
 
 class PostMessage(BaseModel):
-    """Message schema for posts from Kafka."""
-    user_id: int
-    channel_id: int
-    message_id: int
+    """Message schema for posts/articles from Kafka."""
+    source: str = "medium"  # 'medium', 'telegram', etc.
+    source_id: Optional[str] = None  # article_id for Medium
+    source_url: Optional[str] = None  # URL to original
+    title: Optional[str] = None
     text: Optional[str] = None
+    author: Optional[str] = None
+    tag: Optional[str] = None  # Medium tag
     media_urls: list[str] = Field(default_factory=list)
     timestamp: datetime = Field(default_factory=datetime.now)
 
@@ -17,10 +20,12 @@ class PostMessage(BaseModel):
 class FilteredPost(BaseModel):
     """Message schema for filtered posts to Kafka."""
     user_id: int
-    channel_id: int
-    message_id: int
     post_db_id: int
+    title: Optional[str] = None
     text: Optional[str] = None
+    author: Optional[str] = None
+    tag: Optional[str] = None
+    source_url: Optional[str] = None
     media_urls: list[str] = Field(default_factory=list)
     score: float
     timestamp: datetime = Field(default_factory=datetime.now)
@@ -30,7 +35,7 @@ class ReactionMessage(BaseModel):
     """Message schema for reactions from Kafka."""
     user_id: int
     post_id: int
-    reaction: int  # 1=like, -1=dislike, 0=mute
+    reaction: int  # 1=like, -1=dislike
 
 
 class EmbeddingRequest(BaseModel):
@@ -91,4 +96,3 @@ class HealthResponse(BaseModel):
     version: str = "1.0.0"
     kafka_connected: bool
     db_connected: bool
-

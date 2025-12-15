@@ -22,7 +22,7 @@ def build_user_daily_stats(**context):
     Витрина: ежедневная статистика по пользователям.
     
     Агрегирует данные за вчера:
-    - Сколько постов получил пользователь
+    - Сколько статей получил пользователь
     - Сколько было отправлено (прошло фильтр)
     - Сколько лайков/дизлайков поставил
     - Engagement rate
@@ -84,15 +84,15 @@ def build_user_daily_stats(**context):
     print(f"Built dm_user_daily_stats for {target_date}: {affected} rows")
 
 
-def build_channel_stats(**context):
+def build_tag_stats(**context):
     """
-    Витрина: статистика по каналам.
+    Витрина: статистика по тегам.
     
     Агрегирует:
-    - Количество постов из канала
+    - Количество статей по тегу
     - Средний скор релевантности
-    - Реакции на посты канала
-    - Количество подписчиков
+    - Реакции на статьи тега
+    - Количество подписчиков на тег
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -100,12 +100,12 @@ def build_channel_stats(**context):
     target_date = context.get('ds')
     
     cursor.execute("""
-        INSERT INTO dm_channel_stats (
-            channel_id, date, total_posts, total_predictions, posts_sent,
+        INSERT INTO dm_tag_stats (
+            tag, date, total_posts, total_predictions, posts_sent,
             avg_score, positive_reactions, negative_reactions, subscribers, updated_at
         )
         SELECT 
-            po.channel_id,
+            po.tag,
             DATE(po.created_at) as date,
             COUNT(DISTINCT po.id) as total_posts,
             COUNT(pr.id) as total_predictions,
@@ -115,16 +115,16 @@ def build_channel_stats(**context):
             COUNT(r.post_id) FILTER (WHERE r.reaction < 0) as negative_reactions,
             (
                 SELECT COUNT(DISTINCT user_id) 
-                FROM subscriptions 
-                WHERE channel_id = po.channel_id AND is_active = TRUE
+                FROM tag_subscriptions 
+                WHERE tag = po.tag AND is_active = TRUE
             ) as subscribers,
             NOW()
         FROM posts po
         LEFT JOIN predictions pr ON po.id = pr.post_id
         LEFT JOIN reactions r ON po.id = r.post_id
-        WHERE DATE(po.created_at) = %s
-        GROUP BY po.channel_id, DATE(po.created_at)
-        ON CONFLICT (channel_id, date)
+        WHERE DATE(po.created_at) = %s AND po.tag IS NOT NULL
+        GROUP BY po.tag, DATE(po.created_at)
+        ON CONFLICT (tag, date)
         DO UPDATE SET
             total_posts = EXCLUDED.total_posts,
             total_predictions = EXCLUDED.total_predictions,
@@ -141,7 +141,7 @@ def build_channel_stats(**context):
     cursor.close()
     conn.close()
     
-    print(f"Built dm_channel_stats for {target_date}: {affected} rows")
+    print(f"Built dm_tag_stats for {target_date}: {affected} rows")
 
 
 def build_model_performance(**context):
@@ -229,7 +229,7 @@ def cleanup_old_data_marts(**context):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    tables = ['dm_user_daily_stats', 'dm_channel_stats', 'dm_model_performance']
+    tables = ['dm_user_daily_stats', 'dm_tag_stats', 'dm_model_performance']
     
     for table in tables:
         cursor.execute(f"""
@@ -268,9 +268,9 @@ with DAG(
         python_callable=build_user_daily_stats,
     )
     
-    channel_stats_task = PythonOperator(
-        task_id='build_channel_stats',
-        python_callable=build_channel_stats,
+    tag_stats_task = PythonOperator(
+        task_id='build_tag_stats',
+        python_callable=build_tag_stats,
     )
     
     model_perf_task = PythonOperator(
@@ -284,5 +284,4 @@ with DAG(
     )
     
     # Все витрины строятся параллельно, потом cleanup
-    [user_stats_task, channel_stats_task, model_perf_task] >> cleanup_task
-
+    [user_stats_task, tag_stats_task, model_perf_task] >> cleanup_task

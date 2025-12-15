@@ -8,32 +8,35 @@ CREATE TABLE users (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Subscriptions to channels
-CREATE TABLE subscriptions (
+-- User tag subscriptions (which Medium tags to follow)
+CREATE TABLE tag_subscriptions (
     user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    channel_id BIGINT NOT NULL,
-    channel_name TEXT,
-    channel_username TEXT,
+    tag TEXT NOT NULL,
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT NOW(),
-    PRIMARY KEY (user_id, channel_id)
+    PRIMARY KEY (user_id, tag)
 );
 
--- Posts from channels
+-- Posts/Articles from Medium
 CREATE TABLE posts (
     id SERIAL PRIMARY KEY,
-    channel_id BIGINT NOT NULL,
-    message_id BIGINT NOT NULL,
+    source TEXT DEFAULT 'medium',  -- 'medium', 'telegram', etc.
+    source_id TEXT,  -- article_id for Medium
+    source_url TEXT UNIQUE,  -- URL to original article
+    title TEXT,
     text TEXT,
+    author TEXT,
+    tag TEXT,  -- Medium tag
     media_urls TEXT[],
     text_embedding vector(1536),
     image_embedding vector(1536),
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(channel_id, message_id)
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Index for vector similarity search
 CREATE INDEX ON posts USING ivfflat (text_embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX idx_posts_source_url ON posts(source_url);
+CREATE INDEX idx_posts_tag ON posts(tag);
 
 -- Predictions made by the model
 CREATE TABLE predictions (
@@ -45,7 +48,6 @@ CREATE TABLE predictions (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Index for faster lookups
 CREATE INDEX idx_predictions_user_id ON predictions(user_id);
 CREATE INDEX idx_predictions_created_at ON predictions(created_at);
 
@@ -53,7 +55,7 @@ CREATE INDEX idx_predictions_created_at ON predictions(created_at);
 CREATE TABLE reactions (
     user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
     post_id INT REFERENCES posts(id) ON DELETE CASCADE,
-    reaction SMALLINT NOT NULL,  -- 1=like, -1=dislike, 0=mute channel
+    reaction SMALLINT NOT NULL,  -- 1=like, -1=dislike
     created_at TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (user_id, post_id)
 );
@@ -98,9 +100,9 @@ CREATE TABLE dm_user_daily_stats (
     PRIMARY KEY (user_id, date)
 );
 
--- Витрина: статистика по каналам
-CREATE TABLE dm_channel_stats (
-    channel_id BIGINT NOT NULL,
+-- Витрина: статистика по тегам
+CREATE TABLE dm_tag_stats (
+    tag TEXT NOT NULL,
     date DATE NOT NULL,
     total_posts INT DEFAULT 0,
     total_predictions INT DEFAULT 0,
@@ -110,7 +112,7 @@ CREATE TABLE dm_channel_stats (
     negative_reactions INT DEFAULT 0,
     subscribers INT DEFAULT 0,
     updated_at TIMESTAMP DEFAULT NOW(),
-    PRIMARY KEY (channel_id, date)
+    PRIMARY KEY (tag, date)
 );
 
 -- Витрина: эффективность моделей
@@ -130,9 +132,8 @@ CREATE TABLE dm_model_performance (
 );
 
 CREATE INDEX idx_dm_user_daily_date ON dm_user_daily_stats(date);
-CREATE INDEX idx_dm_channel_stats_date ON dm_channel_stats(date);
+CREATE INDEX idx_dm_tag_stats_date ON dm_tag_stats(date);
 CREATE INDEX idx_dm_model_perf_date ON dm_model_performance(date);
 
 -- Insert default demo user for testing
 INSERT INTO users (id, username) VALUES (1, 'demo_user');
-

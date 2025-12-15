@@ -57,7 +57,7 @@ class KafkaService:
                 logger.error(f"Error sending filtered post: {e}")
     
     async def process_raw_post(self, message: PostMessage):
-        """Process a raw post from Kafka."""
+        """Process a raw post/article from Kafka."""
         start_time = time.time()
         
         try:
@@ -69,16 +69,22 @@ class KafkaService:
             
             # Save post to database
             post_id = await db.save_post(
-                channel_id=message.channel_id,
-                message_id=message.message_id,
+                source=message.source,
+                source_id=message.source_id,
+                source_url=message.source_url,
+                title=message.title,
                 text=message.text,
+                author=message.author,
+                tag=message.tag,
                 media_urls=message.media_urls,
                 text_embedding=text_emb,
                 image_embedding=image_emb
             )
             
-            # Get all users subscribed to this channel
-            users = await db.get_users_for_channel(message.channel_id)
+            # Get all users subscribed to this tag
+            users = []
+            if message.tag:
+                users = await db.get_users_for_tag(message.tag)
             
             for user_id in users:
                 # Predict relevance
@@ -105,10 +111,12 @@ class KafkaService:
                     predictions_sent_total.inc()
                     filtered_post = FilteredPost(
                         user_id=user_id,
-                        channel_id=message.channel_id,
-                        message_id=message.message_id,
                         post_db_id=post_id,
+                        title=message.title,
                         text=message.text,
+                        author=message.author,
+                        tag=message.tag,
+                        source_url=message.source_url,
                         media_urls=message.media_urls,
                         score=score,
                         timestamp=message.timestamp
@@ -119,7 +127,7 @@ class KafkaService:
             latency = time.time() - start_time
             inference_latency.observe(latency)
             
-            logger.info(f"Processed post {message.message_id} from channel {message.channel_id}")
+            logger.info(f"Processed article: {message.title[:50] if message.title else 'No title'}... (tag: {message.tag}, users: {len(users)})")
             
         except Exception as e:
             logger.error(f"Error processing post: {e}")
@@ -139,8 +147,6 @@ class KafkaService:
                 reactions_total.labels(reaction="positive").inc()
             elif message.reaction < 0:
                 reactions_total.labels(reaction="negative").inc()
-            else:
-                reactions_total.labels(reaction="mute").inc()
             
             logger.info(f"Saved reaction from user {message.user_id} for post {message.post_id}")
             
@@ -231,4 +237,3 @@ class KafkaService:
 
 # Global Kafka service
 kafka_service = KafkaService()
-

@@ -114,18 +114,19 @@ services:
       - tg_filter_network
     restart: unless-stopped
 
-  # ============ TELEGRAM SERVICES ============
+  # ============ MEDIUM SCRAPER ============
   
-  userbot:
+  medium-scraper:
     build:
-      context: ./services/userbot
+      context: ./services/medium_scraper
       dockerfile: Dockerfile
-    container_name: tg_filter_userbot
+    container_name: tg_filter_medium_scraper
     environment:
       <<: *common-env
-      API_ID: ${API_ID}
-      API_HASH: ${API_HASH}
-      SESSION_STRING: ${SESSION_STRING}
+      MEDIUM_TAGS: ${MEDIUM_TAGS:-programming,technology,software-development}
+      MEDIUM_COOKIE: ${MEDIUM_COOKIE:-}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      MIN_ARTICLE_LENGTH: ${MIN_ARTICLE_LENGTH:-500}
     depends_on:
       postgres:
         condition: service_healthy
@@ -135,6 +136,8 @@ services:
       - tg_filter_network
     restart: unless-stopped
 
+  # ============ TELEGRAM BOT ============
+  
   bot:
     build:
       context: ./services/bot
@@ -305,4 +308,3 @@ volumes:
 networks:
   tg_filter_network:
     driver: bridge
-

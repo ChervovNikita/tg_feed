@@ -41,24 +41,13 @@ async def handle_reaction(callback: CallbackQuery):
     # Map reaction type to value
     reaction_map = {
         "like": 1,
-        "dislike": -1,
-        "mute": 0
+        "dislike": -1
     }
     
     reaction_value = reaction_map.get(reaction_type)
     if reaction_value is None:
         await callback.answer("❌ Неизвестная реакция")
         return
-    
-    # Handle mute (unsubscribe from channel)
-    if reaction_type == "mute":
-        channel_id = await db.get_post_channel_id(post_id)
-        if channel_id:
-            await db.mute_channel_for_user(user_id, channel_id)
-            await callback.answer("🔇 Канал отключён")
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.reply("🔇 Ты отписался от этого канала. Больше посты из него приходить не будут.")
-            return
     
     # Send reaction to Kafka
     try:
@@ -82,9 +71,20 @@ async def handle_reaction(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
+@router.callback_query(F.data.startswith("open_article:"))
+async def handle_open_article(callback: CallbackQuery):
+    """Handle open article callback."""
+    post_id = int(callback.data.split(":")[1])
+    url = await db.get_post_url(post_id)
+    
+    if url:
+        await callback.answer(url=url)
+    else:
+        await callback.answer("❌ Статья не найдена")
+
+
 @router.callback_query(F.data == "cancel")
 async def handle_cancel(callback: CallbackQuery):
     """Handle cancel callback."""
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Отменено")
-

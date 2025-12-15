@@ -11,7 +11,7 @@ from config import settings
 
 # Page config
 st.set_page_config(
-    page_title="TG Channel Filter Analytics",
+    page_title="Medium Article Recommender Analytics",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -54,16 +54,16 @@ def run_query(query: str, params: tuple = None) -> pd.DataFrame:
 
 
 # Sidebar
-st.sidebar.title("📊 TG Channel Filter")
+st.sidebar.title("📊 Medium Recommender")
 st.sidebar.markdown("---")
 
 page = st.sidebar.radio(
     "Navigation",
-    ["📈 Overview", "🔮 Predictions", "👥 Users", "📊 Metrics"]
+    ["📈 Overview", "🔮 Predictions", "👥 Users", "🏷️ Tags", "📊 Metrics"]
 )
 
 st.sidebar.markdown("---")
-st.sidebar.info("ML-powered Telegram channel post filtering system")
+st.sidebar.info("ML-powered Medium article recommendation system")
 
 
 # Overview Page
@@ -78,13 +78,10 @@ if page == "📈 Overview":
     with col1:
         st.metric("👥 Total Users", users_count['count'].iloc[0] if len(users_count) > 0 else 0)
     
-    # Total predictions today
-    preds_today = run_query("""
-        SELECT COUNT(*) as count FROM predictions 
-        WHERE created_at > NOW() - INTERVAL '24 hours'
-    """)
+    # Total articles
+    articles_count = run_query("SELECT COUNT(*) as count FROM posts")
     with col2:
-        st.metric("🔮 Predictions (24h)", preds_today['count'].iloc[0] if len(preds_today) > 0 else 0)
+        st.metric("📄 Total Articles", articles_count['count'].iloc[0] if len(articles_count) > 0 else 0)
     
     # Total reactions
     reactions = run_query("""
@@ -110,25 +107,23 @@ if page == "📈 Overview":
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📊 Predictions Over Time")
-        preds_time = run_query("""
+        st.subheader("📊 Articles Over Time")
+        articles_time = run_query("""
             SELECT 
-                date_trunc('hour', created_at) as hour,
-                COUNT(*) as total,
-                COUNT(*) FILTER (WHERE sent = TRUE) as sent
-            FROM predictions
-            WHERE created_at > NOW() - INTERVAL '7 days'
+                date_trunc('day', created_at) as day,
+                COUNT(*) as total
+            FROM posts
+            WHERE created_at > NOW() - INTERVAL '30 days'
             GROUP BY 1
             ORDER BY 1
         """)
         
-        if len(preds_time) > 0:
-            fig = px.line(preds_time, x='hour', y=['total', 'sent'],
-                         labels={'value': 'Count', 'hour': 'Time'},
-                         title='Predictions vs Sent Posts')
+        if len(articles_time) > 0:
+            fig = px.bar(articles_time, x='day', y='total',
+                        title='New Articles per Day')
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No prediction data available")
+            st.info("No article data available")
     
     with col2:
         st.subheader("📊 Score Distribution")
@@ -194,8 +189,9 @@ elif page == "🔮 Predictions":
             p.score,
             p.sent,
             p.created_at,
-            po.text,
-            po.channel_id
+            po.title,
+            po.tag,
+            po.author
         FROM predictions p
         JOIN posts po ON p.post_id = po.id
         WHERE p.created_at > NOW() - INTERVAL '%s days'
@@ -215,13 +211,8 @@ elif page == "🔮 Predictions":
     st.markdown(f"**Found {len(predictions)} predictions**")
     
     if len(predictions) > 0:
-        # Truncate text for display
-        predictions['text_preview'] = predictions['text'].apply(
-            lambda x: x[:100] + '...' if x and len(x) > 100 else x
-        )
-        
         st.dataframe(
-            predictions[['id', 'user_id', 'score', 'sent', 'created_at', 'text_preview']],
+            predictions[['id', 'user_id', 'score', 'sent', 'created_at', 'title', 'tag', 'author']],
             use_container_width=True
         )
         
@@ -245,13 +236,13 @@ elif page == "👥 Users":
             u.id,
             u.username,
             u.created_at,
-            COUNT(DISTINCT s.channel_id) as subscriptions,
+            COUNT(DISTINCT t.tag) as tag_subscriptions,
             COUNT(DISTINCT p.id) as predictions,
             COUNT(DISTINCT r.post_id) as reactions,
             um.accuracy as model_accuracy,
             um.num_samples as model_samples
         FROM users u
-        LEFT JOIN subscriptions s ON u.id = s.user_id AND s.is_active = TRUE
+        LEFT JOIN tag_subscriptions t ON u.id = t.user_id AND t.is_active = TRUE
         LEFT JOIN predictions p ON u.id = p.user_id
         LEFT JOIN reactions r ON u.id = r.user_id
         LEFT JOIN user_models um ON u.id = um.user_id
@@ -283,6 +274,73 @@ elif page == "👥 Users":
                 st.info("No trained models yet")
     else:
         st.info("No users found")
+
+
+# Tags Page
+elif page == "🏷️ Tags":
+    st.title("🏷️ Tag Analytics")
+    
+    # Tag popularity
+    tag_stats = run_query("""
+        SELECT 
+            p.tag,
+            COUNT(*) as article_count,
+            COUNT(DISTINCT t.user_id) as subscribers,
+            AVG(pr.score) as avg_score
+        FROM posts p
+        LEFT JOIN tag_subscriptions t ON p.tag = t.tag AND t.is_active = TRUE
+        LEFT JOIN predictions pr ON p.id = pr.post_id
+        WHERE p.tag IS NOT NULL
+        GROUP BY p.tag
+        ORDER BY article_count DESC
+    """)
+    
+    if len(tag_stats) > 0:
+        st.subheader("Tag Statistics")
+        st.dataframe(tag_stats, use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Articles per Tag")
+            fig = px.bar(tag_stats.head(15), x='tag', y='article_count',
+                        title='Top 15 Tags by Article Count')
+            fig.update_xaxes(tickangle=45)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.subheader("Subscribers per Tag")
+            fig = px.bar(tag_stats.head(15), x='tag', y='subscribers',
+                        title='Top 15 Tags by Subscribers', color='subscribers')
+            fig.update_xaxes(tickangle=45)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Tag performance over time
+        st.subheader("Tag Activity Over Time")
+        
+        tag_activity = run_query("""
+            SELECT 
+                date_trunc('day', created_at) as day,
+                tag,
+                COUNT(*) as articles
+            FROM posts
+            WHERE created_at > NOW() - INTERVAL '30 days'
+            AND tag IS NOT NULL
+            GROUP BY 1, 2
+            ORDER BY 1
+        """)
+        
+        if len(tag_activity) > 0:
+            # Get top 5 tags
+            top_tags = tag_stats.head(5)['tag'].tolist()
+            filtered_activity = tag_activity[tag_activity['tag'].isin(top_tags)]
+            
+            if len(filtered_activity) > 0:
+                fig = px.line(filtered_activity, x='day', y='articles', color='tag',
+                            title='Articles per Day (Top 5 Tags)')
+                st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No tag data available")
 
 
 # Metrics Page
@@ -341,10 +399,9 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(
     """
     <div style='text-align: center'>
-        <small>TG Channel Filter v1.0</small><br>
+        <small>Medium Recommender v1.0</small><br>
         <small>MLOps Course Project</small>
     </div>
     """,
     unsafe_allow_html=True
 )
-

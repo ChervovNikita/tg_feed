@@ -1,6 +1,4 @@
 """Database operations for ML Service."""
-import pickle
-from datetime import datetime
 from typing import Optional
 import asyncpg
 import numpy as np
@@ -48,29 +46,33 @@ class Database:
     
     async def save_post(
         self,
-        channel_id: int,
-        message_id: int,
+        source: str,
+        source_id: Optional[str],
+        source_url: Optional[str],
+        title: Optional[str],
         text: Optional[str],
+        author: Optional[str],
+        tag: Optional[str],
         media_urls: list[str],
         text_embedding: Optional[np.ndarray],
         image_embedding: Optional[np.ndarray]
     ) -> int:
-        """Save post to database, return post id."""
+        """Save post/article to database, return post id."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO posts (channel_id, message_id, text, media_urls, text_embedding, image_embedding)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (channel_id, message_id) 
+                INSERT INTO posts (source, source_id, source_url, title, text, author, tag, 
+                                   media_urls, text_embedding, image_embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (source_url) 
                 DO UPDATE SET 
-                    text = COALESCE($3, posts.text),
-                    media_urls = COALESCE($4, posts.media_urls),
-                    text_embedding = COALESCE($5, posts.text_embedding),
-                    image_embedding = COALESCE($6, posts.image_embedding)
+                    text = COALESCE($5, posts.text),
+                    text_embedding = COALESCE($9, posts.text_embedding),
+                    image_embedding = COALESCE($10, posts.image_embedding)
                 RETURNING id
                 """,
-                channel_id, message_id, text, media_urls,
-                text_embedding, image_embedding
+                source, source_id, source_url, title, text, author, tag,
+                media_urls, text_embedding, image_embedding
             )
             return row['id']
     
@@ -82,6 +84,15 @@ class Database:
                 post_id
             )
             return dict(row) if row else None
+    
+    async def is_post_exists(self, source_url: str) -> bool:
+        """Check if post already exists."""
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM posts WHERE source_url = $1)",
+                source_url
+            )
+            return result
     
     async def save_prediction(
         self,
@@ -175,40 +186,40 @@ class Database:
             )
             return [dict(row) for row in rows]
     
-    async def get_user_subscriptions(self, user_id: int) -> list[int]:
-        """Get list of channel IDs user is subscribed to."""
+    async def get_user_tags(self, user_id: int) -> list[str]:
+        """Get list of tags user is subscribed to."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT channel_id FROM subscriptions 
+                SELECT tag FROM tag_subscriptions 
                 WHERE user_id = $1 AND is_active = TRUE
                 """,
                 user_id
             )
-            return [row['channel_id'] for row in rows]
+            return [row['tag'] for row in rows]
     
-    async def get_all_active_subscriptions(self) -> list[dict]:
-        """Get all active subscriptions."""
+    async def get_users_for_tag(self, tag: str) -> list[int]:
+        """Get all users subscribed to a tag."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT user_id, channel_id FROM subscriptions 
+                SELECT user_id FROM tag_subscriptions 
+                WHERE tag = $1 AND is_active = TRUE
+                """,
+                tag
+            )
+            return [row['user_id'] for row in rows]
+    
+    async def get_all_subscribed_tags(self) -> list[str]:
+        """Get all tags that at least one user is subscribed to."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT tag FROM tag_subscriptions 
                 WHERE is_active = TRUE
                 """
             )
-            return [dict(row) for row in rows]
-    
-    async def get_users_for_channel(self, channel_id: int) -> list[int]:
-        """Get all users subscribed to a channel."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT user_id FROM subscriptions 
-                WHERE channel_id = $1 AND is_active = TRUE
-                """,
-                channel_id
-            )
-            return [row['user_id'] for row in rows]
+            return [row['tag'] for row in rows]
     
     async def get_users_needing_retraining(self, min_samples: int = 20) -> list[int]:
         """Get users who have enough reactions for training."""
@@ -227,4 +238,3 @@ class Database:
 
 # Global database instance
 db = Database()
-

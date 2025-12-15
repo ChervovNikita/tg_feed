@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     default_threshold: float = 0.5
     min_samples_for_training: int = 20
     
+    # Userbot management
+    userbot_encryption_key: str = ""
+    
     # Service
     service_name: str = "ml-service"
     log_level: str = "INFO"

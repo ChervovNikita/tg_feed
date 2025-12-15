@@ -7,13 +7,14 @@ from typing import Optional
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
 
 from config import settings
 from database import db
 from keyboards import get_reaction_keyboard
-from handlers import start, channels, reactions
+from handlers import start, tags, reactions
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +22,19 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def get_article_keyboard(post_id: int, url: str) -> InlineKeyboardMarkup:
+    """Create keyboard for article with reactions and link."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👍", callback_data=f"react:like:{post_id}"),
+            InlineKeyboardButton(text="👎", callback_data=f"react:dislike:{post_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="📖 Читать на Medium", url=url)
+        ]
+    ])
 
 
 class FilteredPostsConsumer:
@@ -51,9 +65,9 @@ class FilteredPostsConsumer:
                 for tp, msgs in messages.items():
                     for msg in msgs:
                         try:
-                            await self._send_post_to_user(msg.value)
+                            await self._send_article_to_user(msg.value)
                         except Exception as e:
-                            logger.error(f"Error sending post to user: {e}")
+                            logger.error(f"Error sending article to user: {e}")
                 
                 await asyncio.sleep(0.1)
                 
@@ -62,31 +76,51 @@ class FilteredPostsConsumer:
         except Exception as e:
             logger.error(f"Consumer error: {e}")
     
-    async def _send_post_to_user(self, post_data: dict):
-        """Send a filtered post to user."""
+    async def _send_article_to_user(self, post_data: dict):
+        """Send a filtered article to user."""
         user_id = post_data.get('user_id')
         post_id = post_data.get('post_db_id')
+        title = post_data.get('title', '')
         text = post_data.get('text', '')
+        author = post_data.get('author', '')
+        tag = post_data.get('tag', '')
+        url = post_data.get('source_url', '')
         score = post_data.get('score', 0)
-        channel_id = post_data.get('channel_id')
         
         if not user_id or not post_id:
             return
         
         # Build message
-        message_text = text if text else "(пост без текста)"
+        message_parts = []
         
-        # Truncate long messages
-        if len(message_text) > 4000:
-            message_text = message_text[:4000] + "..."
+        if title:
+            message_parts.append(f"<b>{title}</b>")
+        
+        if author:
+            message_parts.append(f"✍️ @{author}")
+        
+        if tag:
+            message_parts.append(f"🏷️ #{tag}")
+        
+        message_parts.append("")  # Empty line
+        
+        # Add text preview
+        if text:
+            preview = text[:500] + "..." if len(text) > 500 else text
+            message_parts.append(preview)
+        
+        message_text = "\n".join(message_parts)
         
         try:
+            keyboard = get_article_keyboard(post_id, url) if url else get_reaction_keyboard(post_id)
+            
             await self.bot.send_message(
                 chat_id=user_id,
                 text=message_text,
-                reply_markup=get_reaction_keyboard(post_id)
+                reply_markup=keyboard,
+                disable_web_page_preview=True
             )
-            logger.info(f"Sent post {post_id} to user {user_id} (score: {score:.2f})")
+            logger.info(f"Sent article {post_id} to user {user_id} (score: {score:.2f})")
         except Exception as e:
             logger.error(f"Failed to send message to user {user_id}: {e}")
     
@@ -108,7 +142,7 @@ async def main():
     
     # Register routers
     dp.include_router(start.router)
-    dp.include_router(channels.router)
+    dp.include_router(tags.router)
     dp.include_router(reactions.router)
     
     # Connect to database
@@ -134,4 +168,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

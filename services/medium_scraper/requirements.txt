@@ -1,0 +1,11 @@
+# Medium Scraper requirements
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+asyncpg>=0.29.0
+kafka-python>=2.0.2
+feedparser>=6.0.0
+cloudscraper>=1.2.0
+requests>=2.31.0
+aiohttp>=3.9.0
+
