@@ -41,6 +41,16 @@ class MediumScraper:
             browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
     
+    def _parse_cookies(self, cookie_string: str) -> dict:
+        """Parse cookie string into dict."""
+        cookies = {}
+        for item in cookie_string.split(';'):
+            item = item.strip()
+            if '=' in item:
+                key, value = item.split('=', 1)
+                cookies[key.strip()] = value.strip()
+        return cookies
+    
     async def start(self):
         """Start the scraper."""
         await self._connect_db()
@@ -242,12 +252,14 @@ class MediumScraper:
         
         url = "https://medium.com/_/graphql"
         
+        # Parse cookies to dict to avoid encoding issues
+        cookies = self._parse_cookies(settings.medium_cookie)
+        
         headers = {
             "accept": "application/json",
             "content-type": "application/json",
             "origin": "https://medium.com",
             "referer": "https://medium.com/",
-            "cookie": settings.medium_cookie,
             "user-agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -255,10 +267,9 @@ class MediumScraper:
             ),
         }
         
-        # Extract XSRF token from cookie
-        m = re.search(r"(?:^|;\s*)xsrf=([^;]+)", settings.medium_cookie)
-        if m:
-            headers["x-xsrf-token"] = m.group(1)
+        # Extract XSRF token from cookies
+        if 'xsrf' in cookies:
+            headers["x-xsrf-token"] = cookies['xsrf']
         
         payload = {
             "operationName": "PostViewer",
@@ -282,7 +293,8 @@ class MediumScraper:
         try:
             response = self.scraper.post(
                 url, 
-                headers=headers, 
+                headers=headers,
+                cookies=cookies,
                 data=json.dumps(payload), 
                 timeout=30
             )

@@ -14,7 +14,7 @@ class PostMessage(BaseModel):
     author: Optional[str] = None
     tag: Optional[str] = None  # Medium tag
     media_urls: list[str] = Field(default_factory=list)
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: Optional[str] = None  # Accept any string format
 
 
 class FilteredPost(BaseModel):
@@ -28,7 +28,7 @@ class FilteredPost(BaseModel):
     source_url: Optional[str] = None
     media_urls: list[str] = Field(default_factory=list)
     score: float
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: Optional[str] = None
 
 
 class ReactionMessage(BaseModel):
