@@ -97,6 +97,101 @@ class Database:
                 post_id
             )
     
+    # ============ Next Post Logic ============
+    
+    async def get_next_post_for_user(self, user_id: int, threshold: float = 0.5) -> Optional[dict]:
+        """
+        Get next unread post for user that passes threshold.
+        Returns post with highest score that hasn't been sent yet.
+        """
+        async with self.pool.acquire() as conn:
+            # Get user's model threshold if exists
+            user_threshold = await conn.fetchval(
+                "SELECT threshold FROM user_models WHERE user_id = $1",
+                user_id
+            )
+            if user_threshold is not None:
+                threshold = user_threshold
+            
+            # Find next post: not sent, score >= threshold, ordered by score desc
+            row = await conn.fetchrow(
+                """
+                SELECT 
+                    p.id as post_id,
+                    p.title,
+                    p.text,
+                    p.author,
+                    p.tag,
+                    p.source_url,
+                    pr.score,
+                    pr.id as prediction_id
+                FROM predictions pr
+                JOIN posts p ON pr.post_id = p.id
+                WHERE pr.user_id = $1 
+                AND pr.sent = FALSE
+                AND pr.score >= $2
+                ORDER BY pr.score DESC, pr.created_at DESC
+                LIMIT 1
+                """,
+                user_id, threshold
+            )
+            return dict(row) if row else None
+    
+    async def mark_prediction_sent(self, prediction_id: int):
+        """Mark a prediction as sent to user."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE predictions SET sent = TRUE WHERE id = $1",
+                prediction_id
+            )
+    
+    async def skip_post(self, user_id: int, post_id: int):
+        """Skip a post (mark as sent without reaction)."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE predictions SET sent = TRUE WHERE user_id = $1 AND post_id = $2",
+                user_id, post_id
+            )
+    
+    async def set_user_waiting(self, user_id: int, waiting: bool):
+        """Set user waiting status for new posts."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (id, waiting_for_posts) 
+                VALUES ($1, $2)
+                ON CONFLICT (id) DO UPDATE SET waiting_for_posts = $2
+                """,
+                user_id, waiting
+            )
+    
+    async def get_users_waiting_for_posts(self) -> List[int]:
+        """Get all users waiting for new posts."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM users WHERE waiting_for_posts = TRUE"
+            )
+            return [row['id'] for row in rows]
+    
+    async def has_new_posts_for_user(self, user_id: int, threshold: float = 0.5) -> bool:
+        """Check if user has any unread posts above threshold."""
+        async with self.pool.acquire() as conn:
+            user_threshold = await conn.fetchval(
+                "SELECT threshold FROM user_models WHERE user_id = $1",
+                user_id
+            )
+            if user_threshold is not None:
+                threshold = user_threshold
+            
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM predictions 
+                WHERE user_id = $1 AND sent = FALSE AND score >= $2
+                """,
+                user_id, threshold
+            )
+            return count > 0
+    
     # ============ User Stats ============
     
     async def get_user_stats(self, user_id: int) -> dict:

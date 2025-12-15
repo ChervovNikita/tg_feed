@@ -5,6 +5,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE users (
     id BIGINT PRIMARY KEY,  -- telegram user_id
     username TEXT,
+    waiting_for_posts BOOLEAN DEFAULT FALSE,  -- true if user is waiting for new posts
     created_at TIMESTAMP DEFAULT NOW()
 );
 

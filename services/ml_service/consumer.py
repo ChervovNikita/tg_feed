@@ -98,30 +98,16 @@ class KafkaService:
                 
                 should_send = score >= threshold
                 
-                # Save prediction
+                # Save prediction (bot will pull posts on demand)
                 await db.save_prediction(
                     user_id=user_id,
                     post_id=post_id,
                     score=score,
-                    sent=should_send
+                    sent=False  # Will be marked sent when user sees it
                 )
                 
-                # Send to filtered_posts if relevant
                 if should_send:
                     predictions_sent_total.inc()
-                    filtered_post = FilteredPost(
-                        user_id=user_id,
-                        post_db_id=post_id,
-                        title=message.title,
-                        text=message.text,
-                        author=message.author,
-                        tag=message.tag,
-                        source_url=message.source_url,
-                        media_urls=message.media_urls,
-                        score=score,
-                        timestamp=message.timestamp
-                    )
-                    self.send_filtered_post(filtered_post)
             
             # Record latency
             latency = time.time() - start_time
