@@ -3,14 +3,15 @@ Medium Article Scraper.
 
 Monitors Medium RSS feeds for new articles and sends them to Kafka
 for processing by the ML service.
+
+Tags are dynamically loaded from user subscriptions in the database.
 """
 import asyncio
 import json
 import logging
 import re
-import time
 from datetime import datetime
-from typing import Optional, Set
+from typing import Optional, Set, List
 
 import asyncpg
 import feedparser
@@ -35,6 +36,7 @@ class MediumScraper:
         self.db_pool: Optional[asyncpg.Pool] = None
         self.producer: Optional[KafkaProducer] = None
         self.seen_urls: Set[str] = set()
+        self.current_tags: Set[str] = set()
         self.scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
@@ -47,12 +49,19 @@ class MediumScraper:
         # Load already processed articles
         await self._load_seen_articles()
         
-        logger.info(f"Starting Medium scraper for tags: {settings.tags_list}")
         logger.info(f"Poll interval: {settings.poll_interval_seconds}s")
+        logger.info("Tags will be loaded dynamically from user subscriptions")
         
         while True:
             try:
-                await self._scrape_all_tags()
+                # Refresh tags from database each iteration
+                await self._refresh_tags()
+                
+                if self.current_tags:
+                    await self._scrape_all_tags()
+                else:
+                    logger.info("No active tag subscriptions found, waiting...")
+                    
             except Exception as e:
                 logger.error(f"Error in scrape loop: {e}")
             
@@ -90,9 +99,38 @@ class MediumScraper:
             self.seen_urls = {row['source_url'] for row in rows}
             logger.info(f"Loaded {len(self.seen_urls)} already processed articles")
     
+    async def _refresh_tags(self):
+        """Load active tags from user subscriptions."""
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT tag FROM tag_subscriptions 
+                WHERE is_active = TRUE
+                """
+            )
+            new_tags = {row['tag'] for row in rows}
+            
+            # Fall back to config tags if no subscriptions
+            if not new_tags:
+                new_tags = set(settings.tags_list)
+                logger.debug(f"No user subscriptions, using default tags: {new_tags}")
+            
+            # Log changes
+            if new_tags != self.current_tags:
+                added = new_tags - self.current_tags
+                removed = self.current_tags - new_tags
+                if added:
+                    logger.info(f"📥 New tags to monitor: {added}")
+                if removed:
+                    logger.info(f"📤 Stopped monitoring tags: {removed}")
+                    
+            self.current_tags = new_tags
+    
     async def _scrape_all_tags(self):
-        """Scrape articles from all configured tags."""
-        for tag in settings.tags_list:
+        """Scrape articles from all active tags."""
+        logger.debug(f"Scraping {len(self.current_tags)} tags: {self.current_tags}")
+        
+        for tag in self.current_tags:
             try:
                 await self._scrape_tag(tag)
             except Exception as e:
@@ -103,12 +141,18 @@ class MediumScraper:
         feed_url = f"https://medium.com/feed/tag/{tag}"
         
         try:
-            feed = feedparser.parse(feed_url)
+            # Use cloudscraper to bypass Cloudflare
+            response = self.scraper.get(feed_url, timeout=30)
+            if response.status_code != 200:
+                logger.warning(f"Failed to fetch feed for tag '{tag}': HTTP {response.status_code}")
+                return
+            feed = feedparser.parse(response.text)
         except Exception as e:
             logger.error(f"Failed to parse feed for tag '{tag}': {e}")
             return
         
         new_articles = 0
+        
         
         for entry in reversed(feed.entries):
             link = entry.get("link", "")
@@ -148,7 +192,10 @@ class MediumScraper:
             )
             
             new_articles += 1
-            logger.info(f"📄 New article: {title[:50]}... by @{author}")
+            logger.info(f"📄 New article: {title[:50]}... by @{author} [#{tag}]")
+            
+            # Delay between articles to avoid rate limiting
+            await asyncio.sleep(2)
         
         if new_articles > 0:
             logger.info(f"Found {new_articles} new articles in tag '{tag}'")
@@ -240,7 +287,22 @@ class MediumScraper:
                 timeout=30
             )
             
+            # Check for Cloudflare block
+            if response.status_code != 200:
+                logger.warning(f"GraphQL HTTP {response.status_code} for article {article_id}")
+                return ""
+            
             raw = response.text.lstrip("])}while(1);</x>")
+            
+            # Check if we got HTML instead of JSON (Cloudflare challenge)
+            if raw.strip().startswith("<!DOCTYPE") or raw.strip().startswith("<html"):
+                logger.warning(f"GraphQL returned HTML (blocked) for article {article_id}")
+                return ""
+            
+            if not raw.strip():
+                logger.warning(f"GraphQL returned empty response for article {article_id}")
+                return ""
+                
             data = json.loads(raw)
             
             if "errors" in data:
@@ -255,6 +317,10 @@ class MediumScraper:
             text = "\n".join(p.get("text", "") for p in paragraphs)
             return text.strip()
             
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error for article {article_id}: {e}")
+            logger.debug(f"Response was: {response.text[:200]}")
+            return ""
         except Exception as e:
             logger.error(f"Error fetching article {article_id}: {e}")
             return ""
@@ -316,4 +382,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
