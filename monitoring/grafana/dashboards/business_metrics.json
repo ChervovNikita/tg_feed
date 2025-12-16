@@ -70,13 +70,13 @@
         "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
         "textMode": "auto"
       },
-      "title": "Active Subscriptions",
+      "title": "Active Tag Subscriptions",
       "type": "stat",
       "targets": [
         {
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT COUNT(*) as value FROM subscriptions WHERE is_active = TRUE",
+          "rawSql": "SELECT COUNT(*) as value FROM tag_subscriptions WHERE is_active = TRUE",
           "refId": "A"
         }
       ]

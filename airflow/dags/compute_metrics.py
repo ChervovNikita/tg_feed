@@ -107,13 +107,12 @@ def compute_user_metrics(**context):
     
     models = cursor.fetchone()
     
-    # Total subscriptions
+    # Total subscriptions (for Medium version: tag_subscriptions)
     cursor.execute("""
         SELECT COUNT(*) as total_subscriptions
-        FROM subscriptions
+        FROM tag_subscriptions
         WHERE is_active = TRUE
     """)
-    
     subs = cursor.fetchone()
     
     # Engagement rate (reactions / sent posts)
