@@ -19,7 +19,8 @@ from schemas import (
     ModelInfo,
     RetrainRequest,
     RetrainResponse,
-    HealthResponse
+    HealthResponse,
+    RecommendResponse,
 )
 from metrics import models_trained_total
 from admin import router as admin_router
@@ -123,6 +124,13 @@ async def predict(request: PredictRequest):
     - **text**: Post text
     - **media_urls**: List of media URLs
     """
+    logger.info(
+        "predict endpoint: user_id=%s text_len=%s media_count=%s",
+        request.user_id,
+        len(request.text) if request.text else 0,
+        len(request.media_urls),
+    )
+
     # Get embeddings
     text_emb, image_emb = await embedding_service.get_combined_embedding(
         text=request.text,
@@ -136,6 +144,13 @@ async def predict(request: PredictRequest):
         image_embedding=image_emb
     )
     
+    logger.info(
+        "predict endpoint result: user_id=%s score=%.4f threshold=%.4f should_send=%s",
+        request.user_id,
+        score,
+        threshold,
+        score >= threshold,
+    )
     return PredictResponse(
         user_id=request.user_id,
         score=score,
@@ -189,6 +204,38 @@ async def retrain_model(user_id: int):
         message="Model trained successfully" if success else "Not enough samples for training",
         accuracy=accuracy,
         num_samples=num_samples
+    )
+
+
+@app.get("/recommend/{user_id}", response_model=RecommendResponse)
+async def recommend_posts(user_id: int, limit: int = 10):
+    """
+    Get recommended posts for a user using a two-tower style model.
+
+    - **user_id**: User ID to get recommendations for
+    - **limit**: Max number of posts to return
+    """
+    logger.info(
+        "recommend endpoint: user_id=%s limit=%s",
+        user_id,
+        limit,
+    )
+
+    # Use database helper that implements two-tower logic on top of pgvector
+    recs = await db.get_recommended_posts_for_user(
+        user_id=user_id,
+        limit=limit,
+    )
+
+    logger.info(
+        "recommend endpoint result: user_id=%s returned=%s",
+        user_id,
+        len(recs),
+    )
+
+    return RecommendResponse(
+        user_id=user_id,
+        recommendations=recs,
     )
 
 

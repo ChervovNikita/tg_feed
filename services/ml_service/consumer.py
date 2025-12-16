@@ -67,7 +67,7 @@ class KafkaService:
                 image_urls=message.media_urls
             )
             
-            # Save post to database
+            # Save post to database (embeddings will be used later via vector search)
             post_id = await db.save_post(
                 source=message.source,
                 source_id=message.source_id,
@@ -81,39 +81,16 @@ class KafkaService:
                 image_embedding=image_emb
             )
             
-            # Get all users subscribed to this tag
-            users = []
-            if message.tag:
-                users = await db.get_users_for_tag(message.tag)
-            
-            for user_id in users:
-                # Predict relevance
-                score, threshold = await model_manager.predict(
-                    user_id=user_id,
-                    text_embedding=text_emb,
-                    image_embedding=image_emb
-                )
-                
-                predictions_total.inc()
-                
-                should_send = score >= threshold
-                
-                # Save prediction (bot will pull posts on demand)
-                await db.save_prediction(
-                    user_id=user_id,
-                    post_id=post_id,
-                    score=score,
-                    sent=False  # Will be marked sent when user sees it
-                )
-                
-                if should_send:
-                    predictions_sent_total.inc()
-            
-            # Record latency
+            # Record latency for embedding + write path
             latency = time.time() - start_time
             inference_latency.observe(latency)
             
-            logger.info(f"Processed article: {message.title[:50] if message.title else 'No title'}... (tag: {message.tag}, users: {len(users)})")
+            logger.info(
+                "Processed article id=%s title=%s tag=%s",
+                post_id,
+                (message.title[:50] if message.title else "No title"),
+                message.tag,
+            )
             
         except Exception as e:
             logger.error(f"Error processing post: {e}")
@@ -133,6 +110,8 @@ class KafkaService:
                 reactions_total.labels(reaction="positive").inc()
             elif message.reaction < 0:
                 reactions_total.labels(reaction="negative").inc()
+            elif message.reaction == 0:
+                reactions_total.labels(reaction="skip").inc()
             
             logger.info(f"Saved reaction from user {message.user_id} for post {message.post_id}")
             

@@ -66,6 +66,24 @@ class PredictResponse(BaseModel):
     threshold: float
 
 
+class Recommendation(BaseModel):
+    """Single recommended post for user."""
+    post_id: int
+    title: Optional[str] = None
+    text: Optional[str] = None
+    author: Optional[str] = None
+    tag: Optional[str] = None
+    source_url: Optional[str] = None
+    media_urls: list[str] = Field(default_factory=list)
+    score: float
+
+
+class RecommendResponse(BaseModel):
+    """Response with recommendations for a user."""
+    user_id: int
+    recommendations: list[Recommendation] = Field(default_factory=list)
+
+
 class ModelInfo(BaseModel):
     """Model information response."""
     user_id: int

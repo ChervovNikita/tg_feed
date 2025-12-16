@@ -1,5 +1,6 @@
 """Reaction and post navigation handlers."""
 import json
+import logging
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -12,6 +13,7 @@ from bot_instance import get_bot
 from next_post import send_next_post_to_user
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 # Kafka producer for reactions
 _producer = None
@@ -53,6 +55,9 @@ async def _send_next_post(callback: CallbackQuery):
 @router.message(Command("next"))
 async def cmd_next(message: Message):
     """Handle /next command - show next post."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
     user_id = message.from_user.id
     bot = get_bot()
 
@@ -60,19 +65,19 @@ async def cmd_next(message: Message):
         await message.answer("❌ Бот ещё не инициализирован, попробуй позже.")
         return
 
-    # Check if user has tag subscriptions
+    # Check if user has tag subscriptions (but don't block - fallback will work)
     tags = await db.get_user_tags(user_id)
+    logger.info("cmd_next: user_id=%s has %s tags: %s", user_id, len(tags), tags)
+    
     if not tags:
-        await message.answer(
-            "❌ Ты не подписан ни на один тег.\n\n"
-            "Используй /tags чтобы выбрать интересующие темы."
-        )
-        return
+        logger.warning("cmd_next: user_id=%s has no tags, but will try fallback anyway", user_id)
+        # Don't block - let fallback handle it (will return any fresh posts)
 
     sent = await send_next_post_to_user(bot, user_id)
 
     if not sent:
         await db.set_user_waiting(user_id, True)
+        logger.info("cmd_next: no posts sent for user_id=%s, marked as waiting", user_id)
         await message.answer(
             "📭 Пока новых статей нет.\n\n"
             "Я напишу тебе, когда появятся интересные материалы!"
@@ -130,8 +135,17 @@ async def handle_skip(callback: CallbackQuery):
     user_id = callback.from_user.id
     post_id = int(callback.data.split(":")[1])
 
-    # Mark as skipped (sent but no reaction)
-    await db.skip_post(user_id, post_id)
+    # Save skip as reaction=0 to exclude from future recommendations
+    # (without affecting user embedding)
+    try:
+        producer = get_producer()
+        producer.send(
+            "reactions",
+            value={"user_id": user_id, "post_id": post_id, "reaction": 0},
+        )
+        producer.flush()
+    except Exception as e:
+        logger.error(f"Error sending skip to Kafka: {e}")
 
     await callback.answer("⏭️ Пропущено")
 

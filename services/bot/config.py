@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # Kafka
     kafka_bootstrap_servers: str = "localhost:9092"
     
+    # ML Service
+    ml_service_url: str = "http://ml-service:8000"
+    
     # Service
     log_level: str = "INFO"
     

@@ -174,23 +174,27 @@ class Database:
             return [row['id'] for row in rows]
     
     async def has_new_posts_for_user(self, user_id: int, threshold: float = 0.5) -> bool:
-        """Check if user has any unread posts above threshold."""
-        async with self.pool.acquire() as conn:
-            user_threshold = await conn.fetchval(
-                "SELECT threshold FROM user_models WHERE user_id = $1",
-                user_id
-            )
-            if user_threshold is not None:
-                threshold = user_threshold
-            
-            count = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM predictions 
-                WHERE user_id = $1 AND sent = FALSE AND score >= $2
-                """,
-                user_id, threshold
-            )
-            return count > 0
+        """
+        Check if user has any new posts available.
+        Uses ML service /recommend endpoint to check (no longer uses predictions table).
+        """
+        import aiohttp
+        from config import settings
+        
+        base_url = settings.ml_service_url.rstrip("/")
+        url = f"{base_url}/recommend/{user_id}"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params={"limit": 1}, timeout=5) as resp:
+                    if resp.status != 200:
+                        return False
+                    data = await resp.json()
+                    recs = data.get("recommendations") or []
+                    return len(recs) > 0
+        except Exception:
+            # If ML service is unavailable, return False (don't spam user)
+            return False
     
     # ============ User Stats ============
     

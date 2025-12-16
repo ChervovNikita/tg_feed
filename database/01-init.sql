@@ -61,6 +61,11 @@ CREATE TABLE reactions (
     PRIMARY KEY (user_id, post_id)
 );
 
+-- Indexes for faster reaction queries
+CREATE INDEX idx_reactions_user_id_created_at ON reactions(user_id, created_at DESC);
+CREATE INDEX idx_reactions_user_id_reaction ON reactions(user_id, reaction) WHERE reaction > 0;  -- For positive reactions
+CREATE INDEX idx_reactions_user_id_reaction_neg ON reactions(user_id, reaction) WHERE reaction < 0;  -- For negative reactions
+
 -- User ML models (serialized weights)
 CREATE TABLE user_models (
     user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

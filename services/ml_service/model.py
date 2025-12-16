@@ -1,11 +1,8 @@
-"""ML Model for post classification."""
+"""Two-tower style recommender: user and item in a shared embedding space."""
 import logging
-import pickle
 from typing import Optional
+
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 
 from config import settings
 from database import db
@@ -14,174 +11,106 @@ logger = logging.getLogger(__name__)
 
 
 class UserModelManager:
-    """Manages ML models for users."""
-    
-    def __init__(self):
-        # Cache of loaded models {user_id: (model, threshold)}
-        self._models_cache: dict[int, tuple[LogisticRegression, float]] = {}
-    
-    def _prepare_features(
+    """
+    Two-tower style scoring instead of per-user logistic regression.
+
+    - User tower: average of embeddings of positively reacted posts
+      (implemented in `db.get_user_embedding`).
+    - Item tower: embedding of current post (text/image).
+    - Score: cosine similarity mapped to [0, 1].
+    """
+
+    async def _get_item_embedding(
         self,
         text_embedding: Optional[np.ndarray],
-        image_embedding: Optional[np.ndarray]
-    ) -> np.ndarray:
-        """Prepare feature vector from embeddings."""
-        dim = settings.embedding_dimension
-        
-        # Default to zeros if embeddings are missing
-        if text_embedding is None:
-            text_embedding = np.zeros(dim, dtype=np.float32)
-        if image_embedding is None:
-            image_embedding = np.zeros(dim, dtype=np.float32)
-        
-        # Concatenate embeddings
-        features = np.concatenate([text_embedding, image_embedding])
-        return features
-    
+        image_embedding: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        """
+        Build a single item embedding from available modalities.
+        For now we prefer text; if нет текста, используем картинку.
+        """
+        if text_embedding is not None:
+            return np.array(text_embedding, dtype=np.float32)
+        if image_embedding is not None:
+            return np.array(image_embedding, dtype=np.float32)
+        return None
+
     async def predict(
         self,
         user_id: int,
         text_embedding: Optional[np.ndarray],
-        image_embedding: Optional[np.ndarray]
+        image_embedding: Optional[np.ndarray],
     ) -> tuple[float, float]:
         """
-        Predict relevance score for a post.
+        Predict relevance score for a post using two-tower embeddings.
         Returns (score, threshold).
         """
-        # Get or load model
-        model, threshold = await self._get_model(user_id)
-        
-        if model is None:
-            # No model yet, use default threshold
+        try:
+            item_emb = await self._get_item_embedding(text_embedding, image_embedding)
+            if item_emb is None:
+                logger.debug(
+                    "predict: no item embedding for user_id=%s (text=%s, image=%s)",
+                    user_id,
+                    text_embedding is not None,
+                    image_embedding is not None,
+                )
+                return 0.5, settings.default_threshold
+
+            user_emb = await db.get_user_embedding(user_id=user_id)
+            if user_emb is None:
+                # Нет пользовательского профиля — нейтральный скор
+                logger.info(
+                    "predict: no user embedding for user_id=%s, returning neutral score",
+                    user_id,
+                )
+                return 0.5, settings.default_threshold
+
+            # Cosine similarity
+            num = float(np.dot(user_emb, item_emb))
+            denom = float(np.linalg.norm(user_emb) * np.linalg.norm(item_emb))
+            if denom == 0:
+                logger.warning(
+                    "predict: zero norm encountered for user_id=%s, returning neutral score",
+                    user_id,
+                )
+                return 0.5, settings.default_threshold
+
+            sim = num / denom  # в [-1, 1]
+            # Маппим в [0, 1]
+            score = 0.5 * (sim + 1.0)
+            logger.debug(
+                "predict: user_id=%s sim=%.4f score=%.4f",
+                user_id,
+                sim,
+                score,
+            )
+            return score, settings.default_threshold
+
+        except Exception as e:
+            logger.error(f"Error in two-tower predict for user_id={user_id}: {e}")
             return 0.5, settings.default_threshold
-        
-        # Prepare features
-        features = self._prepare_features(text_embedding, image_embedding)
-        
-        # Predict probability
-        try:
-            proba = model.predict_proba(features.reshape(1, -1))[0]
-            # Get probability of positive class
-            score = float(proba[1]) if len(proba) > 1 else float(proba[0])
-            return score, threshold
-        except Exception as e:
-            logger.error(f"Error predicting: {e}")
-            return 0.5, threshold
-    
-    async def _get_model(self, user_id: int) -> tuple[Optional[LogisticRegression], float]:
-        """Get model from cache or database."""
-        # Check cache first
-        if user_id in self._models_cache:
-            return self._models_cache[user_id]
-        
-        # Load from database
-        model_data = await db.get_user_model(user_id)
-        
-        if model_data is None or model_data.get('model_weights') is None:
-            return None, settings.default_threshold
-        
-        try:
-            model = pickle.loads(model_data['model_weights'])
-            threshold = model_data.get('threshold', settings.default_threshold)
-            
-            # Cache it
-            self._models_cache[user_id] = (model, threshold)
-            
-            return model, threshold
-        except Exception as e:
-            logger.error(f"Error loading model for user {user_id}: {e}")
-            return None, settings.default_threshold
-    
+
     async def train_model(self, user_id: int) -> tuple[bool, Optional[float], int]:
         """
-        Train a new model for user.
-        Returns (success, accuracy, num_samples).
+        Stub to keep API compatible with old training endpoints.
+        Two-tower вариант не требует отдельного обучения per-user модели.
         """
-        # Get training data
-        training_data = await db.get_training_data(user_id)
-        
-        if len(training_data) < settings.min_samples_for_training:
-            logger.info(f"Not enough samples for user {user_id}: {len(training_data)}")
-            return False, None, len(training_data)
-        
-        # Prepare features and labels
-        X = []
-        y = []
-        
-        for row in training_data:
-            text_emb = row.get('text_embedding')
-            image_emb = row.get('image_embedding')
-            reaction = row['reaction']
-            
-            # Convert numpy arrays
-            if text_emb is not None:
-                text_emb = np.array(text_emb, dtype=np.float32)
-            if image_emb is not None:
-                image_emb = np.array(image_emb, dtype=np.float32)
-            
-            features = self._prepare_features(text_emb, image_emb)
-            X.append(features)
-            
-            # Convert reaction to binary: 1 (like) -> 1, -1 (dislike) -> 0
-            y.append(1 if reaction > 0 else 0)
-        
-        X = np.array(X)
-        y = np.array(y)
-        
-        # Train/test split
-        if len(X) >= 10:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42
-            )
-        else:
-            X_train, X_test, y_train, y_test = X, X, y, y
-        
-        # Train model
-        try:
-            model = LogisticRegression(
-                max_iter=1000,
-                class_weight='balanced',
-                random_state=42
-            )
-            model.fit(X_train, y_train)
-            
-            # Calculate accuracy
-            y_pred = model.predict(X_test)
-            accuracy = accuracy_score(y_test, y_pred)
-            
-            # Serialize model
-            model_bytes = pickle.dumps(model)
-            
-            # Save to database
-            await db.save_user_model(
-                user_id=user_id,
-                model_weights=model_bytes,
-                threshold=settings.default_threshold,
-                accuracy=accuracy,
-                num_samples=len(training_data)
-            )
-            
-            # Update cache
-            self._models_cache[user_id] = (model, settings.default_threshold)
-            
-            logger.info(f"Trained model for user {user_id}: accuracy={accuracy:.3f}, samples={len(training_data)}")
-            
-            return True, accuracy, len(training_data)
-            
-        except Exception as e:
-            logger.error(f"Error training model for user {user_id}: {e}")
-            return False, None, len(training_data)
-    
+        logger.info(
+            f"train_model called for user {user_id}, "
+            "but logistic regression training is disabled in two-tower setup."
+        )
+        # num_samples можно оценить по количеству реакций, если понадобится
+        return False, None, 0
+
     def invalidate_cache(self, user_id: int):
-        """Remove user model from cache."""
-        if user_id in self._models_cache:
-            del self._models_cache[user_id]
-    
+        """No-op for compatibility; two-tower variant не кэширует per-user модели."""
+        return None
+
     def reload_model(self, user_id: int):
-        """Force reload model from database."""
-        self.invalidate_cache(user_id)
+        """No-op for compatibility."""
+        return None
 
 
-# Global model manager
+# Global model manager (now two-tower based)
 model_manager = UserModelManager()
 
