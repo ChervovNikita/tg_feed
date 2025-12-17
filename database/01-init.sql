@@ -18,6 +18,9 @@ CREATE TABLE tag_subscriptions (
     PRIMARY KEY (user_id, tag)
 );
 
+-- Index for faster tag lookups
+CREATE INDEX idx_tag_subscriptions_user_id_active ON tag_subscriptions(user_id, is_active) WHERE is_active = TRUE;
+
 -- Posts/Articles from Medium
 CREATE TABLE posts (
     id SERIAL PRIMARY KEY,

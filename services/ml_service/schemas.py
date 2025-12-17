@@ -84,6 +84,17 @@ class RecommendResponse(BaseModel):
     recommendations: list[Recommendation] = Field(default_factory=list)
 
 
+class PostSentRequest(BaseModel):
+    """Event sent by bot when a post was successfully delivered to a user."""
+    user_id: int
+    post_id: int
+
+
+class PostSentResponse(BaseModel):
+    """Response for post sent event."""
+    success: bool
+
+
 class ModelInfo(BaseModel):
     """Model information response."""
     user_id: int

@@ -18,28 +18,22 @@ class Database:
     
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
-        # Cache for recommendations: user_id -> (timestamp, recommendations)
-        self._recommendation_cache: Dict[int, tuple[float, list[dict]]] = {}
-        # Cache for user embeddings: user_id -> (timestamp, embedding)
-        self._user_embedding_cache: Dict[int, tuple[float, Optional[np.ndarray]]] = {}
-        # Cache for user tags: user_id -> (timestamp, tags)
-        self._user_tags_cache: Dict[int, tuple[float, Optional[List[str]]]] = {}
-        # Locks per user to prevent concurrent requests for same user
-        self._user_locks: Dict[int, asyncio.Lock] = {}
-        self._cache_ttl: float = 5.0  # Cache for 5 seconds
-        self._embedding_cache_ttl: float = 30.0  # Cache user embeddings for 30 seconds
-        self._tags_cache_ttl: float = 60.0  # Cache user tags for 60 seconds (tags change rarely)
+        # Cache for user embeddings: user_id -> (embedding, count, last_updated)
+        # We update this incrementally when new reactions arrive
+        self._user_embedding_cache: Dict[int, tuple[np.ndarray, int, float]] = {}
     
     async def connect(self):
         """Create connection pool."""
         self.pool = await asyncpg.create_pool(
             settings.database_url,
-            min_size=10,
-            max_size=50,  # Much larger pool for high concurrency
+            min_size=50,  # Very large initial pool to prevent exhaustion
+            max_size=200,  # Very large max pool to handle bursts
             init=self._init_connection,
-            command_timeout=120,  # Even longer timeout for slow queries
+            command_timeout=30,  # Reasonable timeout
             max_queries=50000,
             max_inactive_connection_lifetime=300,
+            # Set connection timeout to fail fast if pool is exhausted
+            timeout=10,  # Timeout for acquiring connection from pool
         )
     
     async def _init_connection(self, conn):
@@ -51,7 +45,7 @@ class Database:
         if self.pool:
             await self.pool.close()
     
-    async def _acquire_connection(self, timeout: float = 5.0):
+    async def _acquire_connection(self, timeout: float = 10.0):
         """
         Acquire connection from pool with timeout and logging.
         Helps identify connection pool exhaustion issues.
@@ -59,23 +53,34 @@ class Database:
         import time
         start = time.time()
         try:
+            # Use pool's built-in timeout (set in connect()) plus our own timeout
             conn = await asyncio.wait_for(
                 self.pool.acquire(),
                 timeout=timeout
             )
             elapsed = time.time() - start
-            if elapsed > 0.1:  # Log if waited more than 100ms
+            if elapsed > 0.05:  # Log if waited more than 50ms
+                pool_size = self.pool.get_size() if self.pool else 0
+                pool_idle = self.pool.get_idle_size() if self.pool else 0
                 logger.warning(
-                    "Connection pool: waited %.2fs to acquire connection (pool may be exhausted)",
-                    elapsed
+                    "Connection pool: waited %.2fs to acquire connection (pool size: %s/%s, idle: %s, max: %s)",
+                    elapsed,
+                    pool_size,
+                    self.pool.get_max_size() if self.pool else 0,
+                    pool_idle,
+                    self.pool.get_max_size() if self.pool else 0,
                 )
             return conn
         except asyncio.TimeoutError:
             elapsed = time.time() - start
+            pool_size = self.pool.get_size() if self.pool else 0
+            pool_idle = self.pool.get_idle_size() if self.pool else 0
             logger.error(
-                "Connection pool: timeout after %.2fs waiting for connection (pool size: %s, max: %s)",
+                "Connection pool: timeout after %.2fs waiting for connection (pool size: %s/%s, idle: %s, max: %s)",
                 elapsed,
-                self.pool.get_size() if self.pool else 0,
+                pool_size,
+                self.pool.get_max_size() if self.pool else 0,
+                pool_idle,
                 self.pool.get_max_size() if self.pool else 0,
             )
             raise
@@ -161,6 +166,63 @@ class Database:
                 user_id, post_id, score, sent
             )
             return row['id']
+
+    async def log_recommendations_as_predictions(
+        self,
+        user_id: int,
+        recommendations: list[dict],
+        sent: bool = False,
+    ) -> int:
+        """
+        Log returned recommendations into the `predictions` table.
+        This is used by Streamlit/Grafana as a history table.
+        Returns number of inserted rows.
+        """
+        if not recommendations:
+            return 0
+
+        args: list[tuple] = []
+        for rec in recommendations:
+            post_id = rec.get("post_id")
+            if post_id is None:
+                continue
+            score = float(rec.get("score", 0.0) or 0.0)
+            args.append((user_id, int(post_id), score, bool(sent)))
+
+        if not args:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO predictions (user_id, post_id, score, sent) VALUES ($1, $2, $3, $4)",
+                args,
+            )
+        return len(args)
+
+    async def mark_latest_prediction_sent(self, user_id: int, post_id: int) -> bool:
+        """
+        Mark the most recent prediction row for (user_id, post_id) as sent.
+        Returns True if a row was updated.
+        """
+        async with self.pool.acquire() as conn:
+            res = await conn.execute(
+                """
+                UPDATE predictions
+                SET sent = TRUE
+                WHERE id = (
+                    SELECT id
+                    FROM predictions
+                    WHERE user_id = $1 AND post_id = $2
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
+                  AND sent = FALSE
+                """,
+                user_id,
+                post_id,
+            )
+        # asyncpg returns strings like "UPDATE 1"
+        return res.strip().upper() == "UPDATE 1"
     
     async def save_reaction(
         self,
@@ -168,8 +230,16 @@ class Database:
         post_id: int,
         reaction: int
     ):
-        """Save user reaction and invalidate recommendation cache."""
+        """Save user reaction and update user embedding cache incrementally."""
         async with self.pool.acquire() as conn:
+            # Get old reaction if exists
+            old_reaction_row = await conn.fetchrow(
+                "SELECT reaction FROM reactions WHERE user_id = $1 AND post_id = $2",
+                user_id, post_id
+            )
+            old_reaction = old_reaction_row["reaction"] if old_reaction_row else None
+            
+            # Save new reaction
             await conn.execute(
                 """
                 INSERT INTO reactions (user_id, post_id, reaction)
@@ -179,8 +249,17 @@ class Database:
                 """,
                 user_id, post_id, reaction
             )
-        # Invalidate caches so recommendations reflect new reaction
-        self._invalidate_user_cache(user_id)
+            
+            # Update user embedding cache incrementally if needed
+            if reaction > 0 or (old_reaction and old_reaction > 0):
+                # Need to update embedding - get post embedding
+                post_row = await conn.fetchrow(
+                    "SELECT text_embedding FROM posts WHERE id = $1 AND text_embedding IS NOT NULL",
+                    post_id
+                )
+                if post_row:
+                    post_emb = np.array(post_row["text_embedding"], dtype=np.float32)
+                    self._update_user_embedding_cache(user_id, post_emb, reaction, old_reaction)
     
     async def get_user_model(self, user_id: int) -> Optional[dict]:
         """Get user model from database."""
@@ -239,9 +318,8 @@ class Database:
     
     async def get_user_tags(self, user_id: int) -> list[str]:
         """Get list of tags user is subscribed to."""
-        conn = await self._acquire_connection()
-        try:
-            await conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        # Use context manager to ensure connection is released
+        async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT tag FROM tag_subscriptions 
@@ -250,8 +328,6 @@ class Database:
                 user_id
             )
             return [row['tag'] for row in rows]
-        finally:
-            await self.pool.release(conn)
     
     async def get_users_for_tag(self, tag: str) -> list[int]:
         """Get all users subscribed to a tag."""
@@ -292,6 +368,53 @@ class Database:
 
     # ============ Two-Tower Recommendations ============
 
+    def _update_user_embedding_cache(
+        self,
+        user_id: int,
+        post_emb: np.ndarray,
+        new_reaction: int,
+        old_reaction: Optional[int]
+    ):
+        """
+        Update user embedding cache incrementally when a reaction changes.
+        Uses running average formula: new_avg = (old_avg * n + new_value) / (n + 1)
+        """
+        if user_id not in self._user_embedding_cache:
+            # No cache yet, will be built on next get_user_embedding call
+            return
+        
+        cached_emb, cached_count, _ = self._user_embedding_cache[user_id]
+        
+        # If old reaction was positive, remove it from average
+        if old_reaction and old_reaction > 0:
+            # Remove: new_avg = (old_avg * n - old_value) / (n - 1)
+            if cached_count > 1:
+                cached_emb = (cached_emb * cached_count - post_emb) / (cached_count - 1)
+                cached_count -= 1
+            else:
+                # Was the only one, clear cache
+                del self._user_embedding_cache[user_id]
+                return
+        
+        # If new reaction is positive, add it to average
+        if new_reaction > 0:
+            # Add: new_avg = (old_avg * n + new_value) / (n + 1)
+            if cached_count > 0:
+                cached_emb = (cached_emb * cached_count + post_emb) / (cached_count + 1)
+                cached_count += 1
+            else:
+                # First positive reaction
+                cached_emb = post_emb
+                cached_count = 1
+        
+        # Update cache
+        self._user_embedding_cache[user_id] = (cached_emb, cached_count, time.time())
+        logger.debug(
+            "_update_user_embedding_cache: updated cache for user_id=%s, count=%s",
+            user_id,
+            cached_count,
+        )
+
     async def get_user_embedding(
         self,
         user_id: int,
@@ -299,8 +422,19 @@ class Database:
     ) -> Optional[np.ndarray]:
         """
         Build user embedding as an average of embeddings of positively reacted posts.
-        This keeps the user profile purely "what user likes".
+        Uses cached value if available, otherwise computes from DB and caches it.
         """
+        # Check cache first
+        if user_id in self._user_embedding_cache:
+            cached_emb, cached_count, _ = self._user_embedding_cache[user_id]
+            logger.debug(
+                "get_user_embedding: using cached embedding for user_id=%s (count=%s)",
+                user_id,
+                cached_count,
+            )
+            return cached_emb
+        
+        # Cache miss - compute from DB
         conn = await self._acquire_connection()
         try:
             # Use READ COMMITTED for faster reads (no blocking)
@@ -337,8 +471,12 @@ class Database:
             return None
 
         user_emb = np.mean(embs, axis=0)
+        
+        # Cache the result
+        self._user_embedding_cache[user_id] = (user_emb, len(embs), time.time())
+        
         logger.debug(
-            "get_user_embedding: built user embedding for user_id=%s from %s positives",
+            "get_user_embedding: built and cached user embedding for user_id=%s from %s positives",
             user_id,
             len(embs),
         )
@@ -400,21 +538,6 @@ class Database:
         )
         return neg_emb
 
-    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
-        """Get or create a lock for a user."""
-        if user_id not in self._user_locks:
-            self._user_locks[user_id] = asyncio.Lock()
-        return self._user_locks[user_id]
-    
-    def _invalidate_user_cache(self, user_id: int):
-        """Invalidate caches for a user (called when user reacts to a post)."""
-        if user_id in self._recommendation_cache:
-            del self._recommendation_cache[user_id]
-        if user_id in self._user_embedding_cache:
-            del self._user_embedding_cache[user_id]
-        # Don't invalidate tags cache - tags don't change when user reacts
-        logger.debug("Invalidated caches for user_id=%s", user_id)
-
     async def get_recommended_posts_for_user(
         self,
         user_id: int,
@@ -431,154 +554,56 @@ class Database:
         import time
         start_time = time.time()
         
-        # Use a single connection for all operations to avoid pool exhaustion
+        # 1) Build user embedding
+        t0 = time.time()
+        user_emb = await self.get_user_embedding(
+            user_id=user_id, max_positive_reactions=max_positive_reactions
+        )
+        t1 = time.time()
+        logger.info(
+            "get_recommended_posts_for_user: get_user_embedding took %.2fs for user_id=%s",
+            t1 - t0,
+            user_id,
+        )
+        
+        # Fallback: if no user embedding (cold start), return fresh posts by subscribed tags
+        if user_emb is None:
+            logger.info(
+                "get_recommended_posts_for_user: no user embedding for user_id=%s, using fallback (fresh posts by tags)",
+                user_id,
+            )
+            fallback_recs = await self._get_fallback_recommendations(user_id, limit)
+            logger.info(
+                "get_recommended_posts_for_user: fallback returned %s recommendations for user_id=%s",
+                len(fallback_recs),
+                user_id,
+            )
+            return fallback_recs
+
+        # 2) Optionally restrict by user's subscribed tags
+        t2 = time.time()
+        tags_filter: Optional[List[str]] = None
+        if only_subscribed_tags:
+            tags_filter = await self.get_user_tags(user_id)
+            if not tags_filter:
+                tags_filter = None
+        t3 = time.time()
+        logger.info(
+            "get_recommended_posts_for_user: get_user_tags took %.2fs for user_id=%s",
+            t3 - t2,
+            user_id,
+        )
+
+        # 3) Vector search query
+        # Check if we need embeddings (only if negative embedding exists for penalty)
+        t4 = time.time()
+        neg_emb_check = await self.get_negative_embedding(user_id=user_id)
+        need_embeddings = neg_emb_check is not None
+
+        # 4) Vector search query (use separate connection)
+        t6 = time.time()
         conn = await self._acquire_connection()
         try:
-            # Don't set isolation level - use default (may be faster)
-            
-            # 1) Build user embedding (within same connection)
-            # Check cache first to avoid expensive query
-            t0 = time.time()
-            current_time = time.time()
-            user_emb = None
-            
-            if user_id in self._user_embedding_cache:
-                cached_time, cached_emb = self._user_embedding_cache[user_id]
-                if current_time - cached_time < self._embedding_cache_ttl:
-                    user_emb = cached_emb
-                    logger.debug(
-                        "get_recommended_posts_for_user: using cached user embedding for user_id=%s (age=%.2fs)",
-                        user_id,
-                        current_time - cached_time,
-                    )
-            
-            if user_emb is None:
-                # Fetch from DB
-                query_start = time.time()
-                rows_pos = await conn.fetch(
-                    """
-                    SELECT 
-                        p.text_embedding
-                    FROM reactions r
-                    INNER JOIN posts p ON r.post_id = p.id
-                    WHERE r.user_id = $1
-                      AND r.reaction > 0
-                      AND p.text_embedding IS NOT NULL
-                    ORDER BY r.created_at DESC
-                    LIMIT $2
-                    """,
-                    user_id,
-                    max_positive_reactions,
-                )
-                query_time = time.time() - query_start
-                logger.debug(
-                    "get_recommended_posts_for_user: user embedding query took %.2fs, returned %s rows for user_id=%s",
-                    query_time,
-                    len(rows_pos),
-                    user_id,
-                )
-                
-                if rows_pos:
-                    embs = [np.array(row["text_embedding"], dtype=np.float32) for row in rows_pos]
-                    if embs:
-                        user_emb = np.mean(embs, axis=0)
-                        # Cache the result
-                        self._user_embedding_cache[user_id] = (time.time(), user_emb)
-            
-            t1 = time.time()
-            logger.info(
-                "get_recommended_posts_for_user: get_user_embedding took %.2fs for user_id=%s",
-                t1 - t0,
-                user_id,
-            )
-            
-            # Fallback: if no user embedding (cold start), return fresh posts by subscribed tags
-            if user_emb is None:
-                logger.info(
-                    "get_recommended_posts_for_user: no user embedding for user_id=%s, using fallback (fresh posts by tags)",
-                    user_id,
-                )
-                # Get tags and fallback posts using same connection
-                tags_rows = await conn.fetch(
-                    "SELECT tag FROM tag_subscriptions WHERE user_id = $1 AND is_active = TRUE",
-                    user_id
-                )
-                tags_filter = [row['tag'] for row in tags_rows] if tags_rows else None
-                fallback_recs = await self._get_fallback_recommendations_with_conn(conn, user_id, tags_filter or None, limit)
-                logger.info(
-                    "get_recommended_posts_for_user: fallback returned %s recommendations for user_id=%s",
-                    len(fallback_recs),
-                    user_id,
-                )
-                return fallback_recs
-
-            # 2) Get user's subscribed tags (check cache first)
-            t2 = time.time()
-            tags_filter: Optional[List[str]] = None
-            if only_subscribed_tags:
-                current_time = time.time()
-                cached_tags = None
-                if user_id in self._user_tags_cache:
-                    cached_time, cached_tags = self._user_tags_cache[user_id]
-                    if current_time - cached_time < self._tags_cache_ttl:
-                        tags_filter = cached_tags
-                        logger.debug(
-                            "get_recommended_posts_for_user: using cached tags for user_id=%s",
-                            user_id,
-                        )
-                
-                if tags_filter is None:
-                    tags_rows = await conn.fetch(
-                        "SELECT tag FROM tag_subscriptions WHERE user_id = $1 AND is_active = TRUE",
-                        user_id
-                    )
-                    tags_filter = [row['tag'] for row in tags_rows] if tags_rows else None
-                    # Cache the result (even if empty list)
-                    self._user_tags_cache[user_id] = (time.time(), tags_filter)
-            t3 = time.time()
-            logger.info(
-                "get_recommended_posts_for_user: get_user_tags took %.2fs for user_id=%s",
-                t3 - t2,
-                user_id,
-            )
-
-            # 3) Check for negative embedding (within same connection)
-            t4 = time.time()
-            rows_neg = await conn.fetch(
-                """
-                SELECT 
-                    p.text_embedding
-                FROM reactions r
-                INNER JOIN posts p ON r.post_id = p.id
-                WHERE r.user_id = $1
-                  AND r.reaction < 0
-                  AND p.text_embedding IS NOT NULL
-                ORDER BY r.created_at DESC
-                LIMIT $2
-                """,
-                user_id,
-                100,  # max_negative_reactions
-            )
-            
-            neg_emb = None
-            if rows_neg:
-                neg_embs = [np.array(row["text_embedding"], dtype=np.float32) for row in rows_neg]
-                if neg_embs:
-                    neg_emb = np.mean(neg_embs, axis=0)
-                    norm = float(np.linalg.norm(neg_emb))
-                    if norm > 0:
-                        neg_emb = neg_emb / norm
-            
-            need_embeddings = neg_emb is not None
-            t5 = time.time()
-            logger.info(
-                "get_recommended_posts_for_user: get_negative_embedding took %.2fs for user_id=%s",
-                t5 - t4,
-                user_id,
-            )
-
-            # 4) Vector search query (within same connection)
-            t6 = time.time()
             if tags_filter:
                 if need_embeddings:
                     # Include text_embedding for penalty calculation
@@ -690,81 +715,80 @@ class Database:
                         user_id,
                     limit,
                 )
-            t7 = time.time()
-            logger.info(
-                "get_recommended_posts_for_user: vector search query took %.2fs, fetched %s candidates for user_id=%s",
-                t7 - t6,
-                len(rows),
-                user_id,
-            )
-
-            # 5) Apply penalty and build recommendations (within same connection)
-            recommendations: list[dict] = []
-            t8 = time.time()
-            for row in rows:
-                distance = float(row["distance"])
-                # Convert distance to a similarity-like score in [0, 1)
-                base_score = 1.0 / (1.0 + distance)
-
-                # Apply penalty for similarity to disliked content (if we have such a profile)
-                penalty = 0.0
-                sim_neg = None
-                if neg_emb is not None and need_embeddings:
-                    item_emb_raw = row.get("text_embedding")
-                    if item_emb_raw is not None:
-                        item_emb = np.array(item_emb_raw, dtype=np.float32)
-                        item_norm = float(np.linalg.norm(item_emb))
-                        if item_norm > 0:
-                            item_emb = item_emb / item_norm
-                            # cosine similarity in [-1, 1]; we only penalize for positive similarity
-                            sim_neg = float(np.dot(item_emb, neg_emb))
-                            if sim_neg > 0:
-                                penalty = 0.3 * sim_neg  # 0.3 is a conservative penalty factor
-
-                score = max(0.0, base_score - penalty)
-                recommendations.append(
-                    {
-                        "post_id": row["id"],
-                        "title": row["title"],
-                        "text": row["text"],
-                        "author": row["author"],
-                        "tag": row["tag"],
-                        "source_url": row["source_url"],
-                        "media_urls": row["media_urls"],
-                        "score": score,
-                    }
-                )
-
-                logger.debug(
-                    "get_recommended_posts_for_user: user_id=%s post_id=%s base_score=%.4f penalty=%.4f sim_neg=%s final_score=%.4f",
-                    user_id,
-                    row["id"],
-                    base_score,
-                    penalty,
-                    f"{sim_neg:.4f}" if sim_neg is not None else None,
-                    score,
-                )
-            t9 = time.time()
-            logger.info(
-                "get_recommended_posts_for_user: penalty calculation took %.2fs for user_id=%s",
-                t9 - t8,
-                user_id,
-            )
         finally:
             await self.pool.release(conn)
+        t5 = time.time()
+        logger.info(
+            "get_recommended_posts_for_user: vector search query took %.2fs, fetched %s candidates for user_id=%s",
+            t5 - t4,
+            len(rows),
+            user_id,
+        )
 
-            elapsed = time.time() - start_time
-            logger.info(
-                "get_recommended_posts_for_user: returning %s recommendations for user_id=%s (took %.2fs)",
-                len(recommendations),
-                user_id,
-                elapsed,
+        # Use the negative embedding we already fetched
+        neg_emb = neg_emb_check
+
+        recommendations: list[dict] = []
+        t8 = time.time()
+        for row in rows:
+            distance = float(row["distance"])
+            # Convert distance to a similarity-like score in [0, 1)
+            base_score = 1.0 / (1.0 + distance)
+
+            # Apply penalty for similarity to disliked content (if we have such a profile)
+            penalty = 0.0
+            sim_neg = None
+            if neg_emb is not None and need_embeddings:
+                item_emb_raw = row.get("text_embedding")
+                if item_emb_raw is not None:
+                    item_emb = np.array(item_emb_raw, dtype=np.float32)
+                    item_norm = float(np.linalg.norm(item_emb))
+                    if item_norm > 0:
+                        item_emb = item_emb / item_norm
+                        # cosine similarity in [-1, 1]; we only penalize for positive similarity
+                        sim_neg = float(np.dot(item_emb, neg_emb))
+                        if sim_neg > 0:
+                            penalty = 0.3 * sim_neg  # 0.3 is a conservative penalty factor
+
+            score = max(0.0, base_score - penalty)
+            recommendations.append(
+                {
+                    "post_id": row["id"],
+                    "title": row["title"],
+                    "text": row["text"],
+                    "author": row["author"],
+                    "tag": row["tag"],
+                    "source_url": row["source_url"],
+                    "media_urls": row["media_urls"],
+                    "score": score,
+                }
             )
-            
-            # Cache the result
-            self._recommendation_cache[user_id] = (time.time(), recommendations)
-            
-            return recommendations
+
+            logger.debug(
+                "get_recommended_posts_for_user: user_id=%s post_id=%s base_score=%.4f penalty=%.4f sim_neg=%s final_score=%.4f",
+                user_id,
+                row["id"],
+                base_score,
+                penalty,
+                f"{sim_neg:.4f}" if sim_neg is not None else None,
+                score,
+            )
+        t9 = time.time()
+        logger.info(
+            "get_recommended_posts_for_user: penalty calculation took %.2fs for user_id=%s",
+            t9 - t8,
+            user_id,
+        )
+
+        elapsed = time.time() - start_time
+        logger.info(
+            "get_recommended_posts_for_user: returning %s recommendations for user_id=%s (took %.2fs)",
+            len(recommendations),
+            user_id,
+            elapsed,
+        )
+
+        return recommendations
 
     async def _get_fallback_recommendations(
         self, user_id: int, limit: int = 10

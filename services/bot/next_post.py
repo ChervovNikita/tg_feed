@@ -81,6 +81,17 @@ async def send_next_post_to_user(bot: Bot, user_id: int) -> bool:
             disable_web_page_preview=True,
         )
 
+        # Best-effort: notify ML service that this post was actually delivered
+        try:
+            await _notify_post_sent_to_ml(user_id=user_id, post_id=post["post_id"])
+        except Exception as e:
+            logger.warning(
+                "_notify_post_sent_to_ml failed for user_id=%s post_id=%s: %s",
+                user_id,
+                post["post_id"],
+                e,
+            )
+
         # User is no longer waiting
         await db.set_user_waiting(user_id, False)
 
@@ -112,7 +123,7 @@ async def _fetch_next_post_from_ml(user_id: int) -> Optional[dict]:
         start_time = time.time()
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, params={"limit": 1}) as resp:
+                async with session.get(url, params={"limit": 1, "track": "true"}) as resp:
                     elapsed = time.time() - start_time
                     logger.debug("_fetch_next_post_from_ml: got response in %.2fs for user_id=%s", elapsed, user_id)
                     if resp.status != 200:
@@ -185,6 +196,22 @@ async def _fetch_next_post_from_ml(user_id: int) -> Optional[dict]:
             return None
     
     return None
+
+
+async def _notify_post_sent_to_ml(user_id: int, post_id: int) -> None:
+    """
+    Notify ML service that a post was successfully delivered to the user.
+    This powers Grafana "sent" counters and Streamlit "sent" status.
+    """
+    base_url = settings.ml_service_url.rstrip("/")
+    url = f"{base_url}/events/post_sent"
+    timeout = aiohttp.ClientTimeout(total=5, connect=2)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json={"user_id": user_id, "post_id": post_id}) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"ml-service post_sent failed: status={resp.status} body={text}")
 
 
 async def check_waiting_users(bot: Bot):

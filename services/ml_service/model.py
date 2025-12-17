@@ -48,7 +48,7 @@ class UserModelManager:
         try:
             item_emb = await self._get_item_embedding(text_embedding, image_embedding)
             if item_emb is None:
-                logger.debug(
+                logger.info(
                     "predict: no item embedding for user_id=%s (text=%s, image=%s)",
                     user_id,
                     text_embedding is not None,
@@ -78,7 +78,7 @@ class UserModelManager:
             sim = num / denom  # в [-1, 1]
             # Маппим в [0, 1]
             score = 0.5 * (sim + 1.0)
-            logger.debug(
+            logger.info(
                 "predict: user_id=%s sim=%.4f score=%.4f",
                 user_id,
                 sim,

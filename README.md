@@ -207,6 +207,7 @@ docker-compose ps
 
 ### Airflow (http://localhost:8080)
 - Login: admin / admin
+- Note: Airflow UI often redirects `/` -> `/home` after login (this is normal in Airflow 2.x).
 - DAGs:
   - `retrain_user_models` — переобучение моделей каждые 6 часов
   - `compute_metrics` — вычисление бизнес-метрик
@@ -225,6 +226,8 @@ ML Service предоставляет OpenAPI (Swagger) документацию
 GET  /health              - Проверка здоровья сервиса
 POST /embeddings          - Получить эмбеддинги для текста
 POST /predict             - Предсказать релевантность статьи
+GET  /recommend/{user_id} - Получить рекомендации (use `track=true` to log into `predictions` history)
+POST /events/post_sent    - Событие "пост успешно отправлен пользователю" (обновляет sent-статус + метрики)
 GET  /model/{user_id}     - Информация о модели пользователя
 POST /retrain/{user_id}   - Триггер переобучения модели
 GET  /metrics             - Prometheus метрики

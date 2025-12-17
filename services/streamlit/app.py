@@ -4,6 +4,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -51,6 +55,30 @@ def run_query(query: str, params: tuple = None) -> pd.DataFrame:
     except Exception as e:
         st.error(f"Query error: {e}")
         return pd.DataFrame()
+
+
+def prom_query_instant(query: str) -> float | None:
+    """
+    Execute a Prometheus instant query and return a single float value if available.
+    """
+    base = settings.prometheus_url.rstrip("/")
+    url = f"{base}/api/v1/query?{urlencode({'query': query})}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if payload.get("status") != "success":
+            return None
+        result = payload.get("data", {}).get("result", [])
+        if not result:
+            return None
+        # Take the first series; value is [timestamp, "number"]
+        value = result[0].get("value")
+        if not value or len(value) < 2:
+            return None
+        return float(value[1])
+    except (URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return None
 
 
 # Sidebar
@@ -346,52 +374,77 @@ elif page == "🏷️ Tags":
 # Metrics Page
 elif page == "📊 Metrics":
     st.title("📊 System Metrics")
-    
-    metrics = run_query("""
-        SELECT 
-            metric_name,
-            metric_value,
-            created_at
-        FROM metrics
-        WHERE created_at > NOW() - INTERVAL '7 days'
-        ORDER BY created_at DESC
-    """)
-    
-    if len(metrics) > 0:
-        # Get unique metric names
-        metric_names = metrics['metric_name'].unique()
-        
-        selected_metric = st.selectbox("Select Metric", metric_names)
-        
-        metric_data = metrics[metrics['metric_name'] == selected_metric]
-        
-        fig = px.line(metric_data, x='created_at', y='metric_value',
-                     title=f'{selected_metric} Over Time')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Latest values for all metrics
-        st.subheader("Latest Metric Values")
-        
-        latest_metrics = run_query("""
-            SELECT DISTINCT ON (metric_name) 
+
+    tab_db, tab_prom = st.tabs(["Airflow metrics (DB)", "Prometheus (live)"])
+
+    with tab_prom:
+        st.subheader("Live Prometheus metrics")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        total_preds = prom_query_instant("predictions_total")
+        total_sent = prom_query_instant("predictions_sent_total")
+        p95_inf = prom_query_instant("histogram_quantile(0.95, sum(rate(inference_latency_seconds_bucket[5m])) by (le))")
+        react_rate = prom_query_instant("sum(rate(reactions_total[5m]))")
+
+        with col1:
+            st.metric("🔮 Total Predictions", int(total_preds) if total_preds is not None else "—")
+        with col2:
+            st.metric("📬 Posts Sent", int(total_sent) if total_sent is not None else "—")
+        with col3:
+            st.metric("⏱️ Inference p95 (s)", f"{p95_inf:.3f}" if p95_inf is not None else "—")
+        with col4:
+            st.metric("⚡ Reactions rate (5m)", f"{react_rate:.3f}/s" if react_rate is not None else "—")
+
+        if total_preds is None and total_sent is None and p95_inf is None and react_rate is None:
+            st.info(
+                "Prometheus is not reachable from Streamlit (or no data yet). "
+                "Expected URL inside Docker: "
+                f"{settings.prometheus_url}"
+            )
+
+    with tab_db:
+        st.subheader("Airflow metrics (stored in DB)")
+        metrics = run_query("""
+            SELECT 
                 metric_name,
                 metric_value,
                 created_at
             FROM metrics
-            ORDER BY metric_name, created_at DESC
+            WHERE created_at > NOW() - INTERVAL '7 days'
+            ORDER BY created_at DESC
         """)
-        
-        if len(latest_metrics) > 0:
-            cols = st.columns(min(4, len(latest_metrics)))
-            for i, row in latest_metrics.iterrows():
-                with cols[i % 4]:
-                    st.metric(
-                        row['metric_name'],
-                        f"{row['metric_value']:.2f}",
-                        help=f"Updated: {row['created_at']}"
-                    )
-    else:
-        st.info("No metrics data available. Metrics will appear after Airflow DAGs run.")
+
+        if len(metrics) > 0:
+            metric_names = metrics['metric_name'].unique()
+            selected_metric = st.selectbox("Select Metric", metric_names)
+
+            metric_data = metrics[metrics['metric_name'] == selected_metric]
+            fig = px.line(metric_data, x='created_at', y='metric_value',
+                         title=f'{selected_metric} Over Time')
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Latest Metric Values")
+            latest_metrics = run_query("""
+                SELECT DISTINCT ON (metric_name) 
+                    metric_name,
+                    metric_value,
+                    created_at
+                FROM metrics
+                ORDER BY metric_name, created_at DESC
+            """)
+
+            if len(latest_metrics) > 0:
+                cols = st.columns(min(4, len(latest_metrics)))
+                for i, row in latest_metrics.iterrows():
+                    with cols[i % 4]:
+                        st.metric(
+                            row['metric_name'],
+                            f"{row['metric_value']:.2f}",
+                            help=f"Updated: {row['created_at']}"
+                        )
+        else:
+            st.info("No DB metrics data available. Metrics will appear after Airflow DAGs run.")
 
 
 # Footer

@@ -21,8 +21,10 @@ from schemas import (
     RetrainResponse,
     HealthResponse,
     RecommendResponse,
+    PostSentRequest,
+    PostSentResponse,
 )
-from metrics import models_trained_total
+from metrics import models_trained_total, predictions_total, predictions_sent_total
 from admin import router as admin_router
 
 # Configure logging
@@ -208,7 +210,7 @@ async def retrain_model(user_id: int):
 
 
 @app.get("/recommend/{user_id}", response_model=RecommendResponse)
-async def recommend_posts(user_id: int, limit: int = 10):
+async def recommend_posts(user_id: int, limit: int = 10, track: bool = False):
     """
     Get recommended posts for a user using a two-tower style model.
 
@@ -227,6 +229,15 @@ async def recommend_posts(user_id: int, limit: int = 10):
         limit=limit,
     )
 
+    if track and recs:
+        inserted = await db.log_recommendations_as_predictions(
+            user_id=user_id,
+            recommendations=recs,
+            sent=False,
+        )
+        if inserted:
+            predictions_total.inc(inserted)
+
     logger.info(
         "recommend endpoint result: user_id=%s returned=%s",
         user_id,
@@ -237,6 +248,21 @@ async def recommend_posts(user_id: int, limit: int = 10):
         user_id=user_id,
         recommendations=recs,
     )
+
+
+@app.post("/events/post_sent", response_model=PostSentResponse)
+async def post_sent_event(request: PostSentRequest):
+    """
+    Called by the bot after it successfully sent a post to the user.
+    Updates predictions history and increments monitoring counters.
+    """
+    updated = await db.mark_latest_prediction_sent(
+        user_id=request.user_id,
+        post_id=request.post_id,
+    )
+    if updated:
+        predictions_sent_total.inc()
+    return PostSentResponse(success=updated)
 
 
 @app.post("/reload/{user_id}")
