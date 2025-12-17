@@ -259,6 +259,7 @@ services:
       - -c
       - |
         pip install -r /requirements.txt
+        rm -f /opt/airflow/airflow-webserver.pid
         airflow webserver
     ports:
       - "8080:8080"
@@ -288,6 +289,7 @@ services:
       - -c
       - |
         pip install -r /requirements.txt
+        rm -f /opt/airflow/airflow-scheduler.pid
         airflow scheduler
     depends_on:
       airflow-init:
